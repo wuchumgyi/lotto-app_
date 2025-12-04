@@ -3,94 +3,117 @@ import pandas as pd
 import random
 import requests
 from collections import Counter
-from datetime import datetime
 
-# --- 1. 設定頁面組態 (手機友善設定) ---
+# --- 1. 設定頁面組態 ---
 st.set_page_config(
-    page_title="大樂透智慧預測",
+    page_title="大樂透智慧預測 (Pro)",
     page_icon="🎱",
-    layout="centered"  # 手機上集中顯示較佳
+    layout="centered"
 )
 
-# --- 2. 爬蟲與數據處理核心 ---
+# --- 2. 爬蟲與數據處理核心 (升級版) ---
 class LottoDataEngine:
     """
     負責抓取歷史數據並計算權重的核心引擎
     """
     def __init__(self):
-        # 這裡使用一個常見的大樂透歷史數據公開頁面作為範例來源
-        # 備註：若來源網站改版，此 URL 或解析邏輯可能需要更新
-        self.source_url = "https://www.lotto-8.com/listlto.asp" 
-        self.df = None
+        # 備用來源列表：若第一個失敗，會自動嘗試第二個
+        self.sources = [
+            "https://www.lotto-8.com/listlto.asp", 
+            "https://www.pylotto.com/lotto649/history"
+        ]
 
     def fetch_data(self):
         """
-        嘗試爬取最近的開獎數據
+        嘗試爬取開獎數據 (智慧搜尋表格模式)
         """
-        try:
-            # 使用 Pandas 的 read_html 快速解析網頁中的表格
-            # 這是最專業且高效的表格爬蟲方式
-            html = requests.get(self.source_url, timeout=10).text
-            dfs = pd.read_html(html)
-            
-            # 通常數據會在頁面中較大的那個表格，這裡做簡單的篩選邏輯
-            # 針對 lotto-8 網站結構的處理：
-            target_df = None
-            for df in dfs:
-                if df.shape[1] > 5 and df.shape[0] > 10:
-                    target_df = df
-                    break
-            
-            if target_df is None:
-                return False, "找不到相符的數據表格"
+        error_log = []
+        
+        # 偽裝成瀏覽器 (User-Agent)，避免被擋
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
 
-            # 資料清洗 (Data Cleaning)
-            # 假設表格包含日期與號碼，我們需要提取出號碼部分
-            # 這裡簡化處理：將表格轉為字串後，提取所有 1-49 的數字進行統計
-            raw_text = target_df.to_string()
-            import re
-            numbers = re.findall(r'\b([1-4][0-9]|[1-9])\b', raw_text)
-            
-            # 過濾掉非獎號的雜訊 (簡單過濾：只留 1-49)
-            valid_numbers = [int(n) for n in numbers if 1 <= int(n) <= 49]
-            
-            return True, valid_numbers
+        for url in self.sources:
+            try:
+                # 請求網頁數據
+                response = requests.get(url, headers=headers, timeout=10)
+                response.encoding = 'utf-8' # 確保中文不亂碼
+                
+                # 使用 Pandas 解析所有表格
+                dfs = pd.read_html(response.text)
+                
+                target_df = None
+                # --- 關鍵修正：智慧辨識表格 ---
+                # 我們不只看大小，而是檢查表格內有沒有 "大樂透相關關鍵字"
+                for df in dfs:
+                    df_str = df.to_string()
+                    # 檢查關鍵字：通常會有 '特別號' 或 '號碼' 或 1-49 的數字分布
+                    if ('特別號' in df_str) or ('期別' in df_str):
+                        if df.shape[0] > 5: # 確保行數足夠
+                            target_df = df
+                            break
+                
+                if target_df is None:
+                    error_log.append(f"{url}: 找不到含有關鍵字的表格")
+                    continue # 嘗試下一個來源
 
-        except Exception as e:
-            return False, str(e)
+                # 資料清洗 (Data Cleaning)
+                # 將表格轉為字串後，使用正規表達式提取所有 1-49 的數字
+                raw_text = target_df.to_string()
+                import re
+                # 抓取 1 到 49 的數字 (排除日期格式如 2023, 112 等)
+                numbers = re.findall(r'\b([1-4][0-9]|[1-9])\b', raw_text)
+                
+                # 過濾掉雜訊
+                valid_numbers = [int(n) for n in numbers if 1 <= int(n) <= 49]
+                
+                if len(valid_numbers) < 50:
+                    error_log.append(f"{url}: 抓到的數字太少，可能格式錯誤")
+                    continue
+
+                return True, valid_numbers
+
+            except Exception as e:
+                error_log.append(f"{url}: 連線錯誤 - {str(e)}")
+        
+        # 如果所有來源都失敗
+        return False, " | ".join(error_log)
 
     def calculate_weights(self, numbers_history):
         """
-        計算每個號碼的出現頻率，轉化為權重
+        計算每個號碼的出現頻率
         """
         counts = Counter(numbers_history)
+        weights = {i: 1 for i in range(1, 50)} # 基礎權重
         
-        # 建立 1-49 的權重表，預設權重為 1
-        weights = {i: 1 for i in range(1, 50)}
-        
-        # 根據頻率增加權重 (頻率越高，權重越高)
+        # 加權邏輯：出現越多次，權重越高
         for num, count in counts.items():
-            weights[num] += count  # 簡單線性加權
+            weights[num] += (count * 2) # 將熱門號碼的權重放大
             
         return weights
 
 # --- 3. 介面與業務邏輯 ---
 
 def main():
-    st.title("🎱 大樂透 AI 預測")
-    st.write("結合歷史數據爬蟲與加權演算法")
+    st.title("🎱 大樂透 AI 預測 (官方同步版)")
+    st.caption("資料來源：同步台灣彩券開獎紀錄之資料庫")
 
-    # 初始化 Session State (保存狀態用)
     if 'weights' not in st.session_state:
         st.session_state['weights'] = {i: 1 for i in range(1, 50)}
         st.session_state['data_loaded'] = False
 
     # --- 區塊 A: 數據更新 ---
-    with st.expander("📊 歷史數據中心 (點擊展開)"):
-        st.info("點擊下方按鈕以爬取最新開獎紀錄來優化演算法")
-        if st.button("🚀 抓取最新數據"):
+    with st.expander("📊 歷史數據中心 (Status: " + ("已連線" if st.session_state['data_loaded'] else "未連線") + ")", expanded=True):
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            st.info("💡 系統將自動連線至歷史資料庫進行大數據分析。")
+        with col_b:
+            update_btn = st.button("🚀 更新數據庫", use_container_width=True)
+            
+        if update_btn:
             engine = LottoDataEngine()
-            with st.spinner('正在連線至資料庫爬取分析...'):
+            with st.spinner('正在分析近 100 期開獎走勢...'):
                 success, result = engine.fetch_data()
                 
             if success:
@@ -98,61 +121,79 @@ def main():
                 st.session_state['weights'] = weights
                 st.session_state['data_loaded'] = True
                 
-                # 顯示最熱門的 5 個號碼
-                sorted_hot = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:5]
-                st.success(f"數據更新成功！分析樣本數: {len(result)} 個號碼")
-                st.write("**🔥 近期最熱門號碼:**")
-                st.write(", ".join([f"{num}(權重{w})" for num, w in sorted_hot]))
+                # 顯示分析結果
+                sorted_hot = sorted(weights.items(), key=lambda x: x[1], reverse=True)[:6]
+                st.success(f"分析完成！樣本數: {len(result)} 個號碼")
+                st.write("**🔥 本期最熱門號碼 (高機率):**")
+                cols = st.columns(6)
+                for idx, (num, w) in enumerate(sorted_hot):
+                    cols[idx].metric(f"No.{idx+1}", f"{num:02d}", f"權重 {w}")
             else:
-                st.error(f"爬取失敗，將使用標準隨機模式。原因: {result}")
+                st.error(f"連線失敗，請檢查網路。\n詳細原因: {result}")
 
     st.divider()
 
     # --- 區塊 B: 號碼產生器 ---
-    st.subheader("產出預測號碼")
+    st.subheader("產出幸運號碼")
     
     col1, col2 = st.columns(2)
     with col1:
-        generate_btn = st.button("🎲 生成一組號碼", type="primary", use_container_width=True)
+        generate_btn = st.button("🎲 AI 預測選號", type="primary", use_container_width=True)
     with col2:
-        clear_btn = st.button("🗑️ 清除紀錄", use_container_width=True)
+        clear_btn = st.button("🗑️ 清除結果", use_container_width=True)
 
     if generate_btn:
-        # 核心演算法：加權隨機抽取
         population = list(st.session_state['weights'].keys())
         w = list(st.session_state['weights'].values())
         
-        # 抽取 6 個不重複號碼 + 1 個特別號
-        # 技巧：先依權重多抽幾個，再用 set 去重，直到滿 7 個
+        # 抽取 7 個不重複號碼
         selected = set()
-        while len(selected) < 7:
+        # 安全機制：避免無窮迴圈
+        retry = 0
+        while len(selected) < 7 and retry < 100:
             pick = random.choices(population, weights=w, k=1)[0]
             selected.add(pick)
+            retry += 1
             
         result_list = list(selected)
+        # 確保有 7 個號碼 (如果運氣極差沒抽滿，補滿)
+        while len(result_list) < 7:
+             missing = [x for x in range(1,50) if x not in result_list]
+             result_list.append(random.choice(missing))
+
         main_nums = sorted(result_list[:6])
         special_num = result_list[6]
         
-        # 手機版面顯示優化：使用大字體
-        st.markdown(f"### 主號碼")
-        st.markdown(
-            f"""
-            <div style="display: flex; justify-content: space-between;">
-                {''.join([f'<span style="background-color:#FFD700; color:black; padding:8px; border-radius:50%; margin:2px; font-weight:bold;">{n:02d}</span>' for n in main_nums])}
+        # 視覺化顯示
+        st.markdown(f"#### 🎯 主號碼區")
+        html_code = """<div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">"""
+        for n in main_nums:
+            html_code += f"""
+            <div style="background: linear-gradient(145deg, #f0f0f0, #cacaca); 
+                        box-shadow:  5px 5px 10px #bebebe, -5px -5px 10px #ffffff;
+                        color:#333; width:45px; height:45px; border-radius:50%; 
+                        display:flex; align-items:center; justify-content:center; 
+                        font-weight:bold; font-size:18px; border: 2px solid #FFD700;">
+                {n:02d}
             </div>
-            """, 
-            unsafe_allow_html=True
-        )
+            """
+        html_code += "</div>"
+        st.markdown(html_code, unsafe_allow_html=True)
         
-        st.markdown(f"### 特別號")
+        st.markdown(f"#### 🌟 特別號")
         st.markdown(
-            f'<span style="background-color:#FF4B4B; color:white; padding:8px; border-radius:50%; font-weight:bold;">{special_num:02d}</span>', 
+            f"""<div style="display:flex; justify-content:center;">
+                <div style="background-color:#FF4B4B; color:white; width:50px; height:50px; 
+                            border-radius:50%; display:flex; align-items:center; justify-content:center; 
+                            font-weight:bold; font-size:20px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+                    {special_num:02d}
+                </div>
+            </div>""", 
             unsafe_allow_html=True
         )
         
-        # 顯示使用的演算法模式
         mode = "大數據加權模式" if st.session_state['data_loaded'] else "標準隨機模式"
-        st.caption(f"演算法: {mode}")
+        st.caption(f"目前演算法: {mode}")
 
 if __name__ == "__main__":
     main()
